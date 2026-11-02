@@ -1,0 +1,9 @@
+# Daemon binaries are fetched per README Deploy step 3 (tens of MB each);
+# they do not belong in git.
+vendor/xray
+vendor/cloudflared
+
+# Runtime state
+logs/
+bin/
+.env
