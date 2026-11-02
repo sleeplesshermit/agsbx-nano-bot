@@ -20,6 +20,20 @@ for **~128 MB containers** — built for the Galaxy Cloud Sandbox ("Nano",
 Steady-state target: ~85–110 MB (Node ~35–45 + xray ~15–20 +
 cloudflared ~30–40 + bash ~4).
 
+## Changelog
+
+- **v1.0.1 (2026-11-02)** — supervision loop no longer uses `pgrep`:
+  on Galaxy it silently reported both daemons dead every 60 s while
+  they were in fact healthy (the tunnel never dropped), re-running
+  the installer in a loop. Replaced with a dependency-free /proc
+  cmdline scan. Also added a no-op `build` script (`true`) because
+  Galaxy's default build command is `npm run build` and a missing
+  script fails the first deploy.
+- **v1.0.0** — initial trimmed release. Note: on Galaxy the free
+  container actually provisioned as **g.nano = 384 MB RAM / 0.3 gCPU**
+  (the docs' 128 MB figure is outdated), so the trims are headroom,
+  not survival.
+
 ## Deploy (Galaxy)
 
 1. Galaxy dashboard → Create New → Deploy New App → **Node.js**.
