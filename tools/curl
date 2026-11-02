@@ -1,0 +1,241 @@
+#!/usr/bin/env node
+// httpget shim — a zero-dependency Node stand-in for the curl / wget
+// subsets that the argosbx installer and this package's start.sh use.
+// Some bot-room images (e.g. BotKeep) ship neither tool, which silently
+// breaks every download step inside the installer.
+//
+// Behaviour switches on the name it is invoked as (argv[0] basename):
+//   curl  — accepts: -L -s -S -f -k -# -O -4 -6, bundled short flags,
+//           -o <file>, -m <secs>, -A <ua>, -H <header>,
+//           --retry <n>, --retry-delay <s>, --max-time <s>,
+//           --connect-timeout <s>, --output <file>, --location,
+//           --silent, --show-error, --fail, --insecure, --ipv4, --ipv6,
+//           --progress-bar (accepted, ignored), --url <url>
+//   wget  — accepts: -q, -O <file> ("-O-" = stdout), --tries <n>,
+//           -4, -6, --no-check-certificate
+// Only HTTP(S) GET is implemented; redirects are followed (curl: only
+// with -L, wget: always). Exit codes mirror the real tools where the
+// installer could care: curl 22 on HTTP failure with -f, wget 8 on any
+// HTTP failure, 0 on success, nonzero on network errors.
+'use strict';
+
+// A downstream consumer closing the pipe early (e.g. `| head`) is not an
+// error: exit quietly like the real tools do instead of crashing with an
+// unhandled EPIPE.
+process.stdout.on('error', (e) => {
+  if (e && e.code === 'EPIPE') process.exit(0);
+});
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const { URL } = require('url');
+
+const invokedAs = (process.argv[1] || '').split('/').pop() || '';
+const IS_WGET = invokedAs.includes('wget');
+
+const opts = {
+  url: null,
+  output: null, // null = default (curl: stdout; wget: basename of URL)
+  follow: IS_WGET,
+  silent: IS_WGET, // wget -q is passed at every call site we care about
+  showError: false,
+  fail: IS_WGET, // wget errors on HTTP >= 400 by default; curl only with -f
+  insecure: false,
+  family: undefined, // 4 | 6
+  maxTimeMs: 0,
+  retries: 0,
+  retryDelayMs: 1000,
+  headers: {},
+};
+
+function parseCurl(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') continue;
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const key = eq >= 0 ? a.slice(0, eq) : a;
+      const val = eq >= 0 ? a.slice(eq + 1) : null;
+      const take = () => (val !== null ? val : args[++i]);
+      switch (key) {
+        case '--location': opts.follow = true; break;
+        case '--silent': opts.silent = true; break;
+        case '--show-error': opts.showError = true; break;
+        case '--fail': opts.fail = true; break;
+        case '--insecure': opts.insecure = true; break;
+        case '--ipv4': opts.family = 4; break;
+        case '--ipv6': opts.family = 6; break;
+        case '--progress-bar': break;
+        case '--output': opts.output = take(); break;
+        case '--retry': opts.retries = parseInt(take(), 10) || 0; break;
+        case '--retry-delay': opts.retryDelayMs = (parseFloat(take()) || 0) * 1000; break;
+        case '--max-time': opts.maxTimeMs = (parseFloat(take()) || 0) * 1000; break;
+        case '--connect-timeout': break; // accepted, not separately enforced
+        case '--url': opts.url = take(); break;
+        case '--user-agent': opts.headers['user-agent'] = take(); break;
+        case '--header': { const h = take(); const c = h.indexOf(':'); if (c > 0) opts.headers[h.slice(0, c).trim().toLowerCase()] = h.slice(c + 1).trim(); break; }
+        default: break; // unknown long options are ignored, like the call sites expect
+      }
+      continue;
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      const chars = a.slice(1);
+      for (let j = 0; j < chars.length; j++) {
+        const ch = chars[j];
+        const rest = chars.slice(j + 1);
+        switch (ch) {
+          case 'L': opts.follow = true; break;
+          case 's': opts.silent = true; break;
+          case 'S': opts.showError = true; break;
+          case 'f': opts.fail = true; break;
+          case 'k': opts.insecure = true; break;
+          case '#': break; // progress bar: accepted, stays quiet
+          case '4': opts.family = 4; break;
+          case '6': opts.family = 6; break;
+          case 'O': opts.output = ''; break; // fill from URL basename later
+          case 'o': opts.output = rest || args[++i]; j = chars.length; break;
+          case 'm': opts.maxTimeMs = (parseFloat(rest || args[++i]) || 0) * 1000; j = chars.length; break;
+          case 'A': opts.headers['user-agent'] = rest || args[++i]; j = chars.length; break;
+          case 'H': { const h = rest || args[++i]; const c = h.indexOf(':'); if (c > 0) opts.headers[h.slice(0, c).trim().toLowerCase()] = h.slice(c + 1).trim(); j = chars.length; break; }
+          default: break; // ignore unknown short flags
+        }
+      }
+      continue;
+    }
+    opts.url = a; // last bare argument wins
+  }
+}
+
+function parseWget(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      const key = eq >= 0 ? a.slice(0, eq) : a;
+      const val = eq >= 0 ? a.slice(eq + 1) : null;
+      const take = () => (val !== null ? val : args[++i]);
+      switch (key) {
+        case '--tries': opts.retries = Math.max(0, (parseInt(take(), 10) || 1) - 1); break;
+        case '--no-check-certificate': opts.insecure = true; break;
+        case '--output-document': opts.output = take(); break;
+        case '--timeout': opts.maxTimeMs = (parseFloat(take()) || 0) * 1000; break;
+        default: break;
+      }
+      continue;
+    }
+    if (a.startsWith('-') && a.length > 1) {
+      const chars = a.slice(1);
+      for (let j = 0; j < chars.length; j++) {
+        const ch = chars[j];
+        const rest = chars.slice(j + 1);
+        switch (ch) {
+          case 'q': opts.silent = true; break;
+          case '4': opts.family = 4; break;
+          case '6': opts.family = 6; break;
+          case 'O': opts.output = rest !== '' ? rest : args[++i]; j = chars.length; break;
+          default: break;
+        }
+      }
+      continue;
+    }
+    opts.url = a;
+  }
+}
+
+function errExit(code, msg) {
+  if (!opts.silent || opts.showError) process.stderr.write(`curl-shim: ${msg}\n`);
+  process.exit(code);
+}
+
+function fetchOnce(urlStr, redirectsLeft) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(urlStr); } catch (e) { reject(new Error(`bad URL: ${urlStr}`)); return; }
+    const lib = u.protocol === 'https:' ? https : http;
+    const headers = Object.assign({ 'user-agent': 'curl-shim/1.2 (agsbx-min-bot)' }, opts.headers);
+    const req = lib.request({
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || undefined,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers,
+      family: opts.family,
+      rejectUnauthorized: !opts.insecure,
+    }, (res) => {
+      const status = res.statusCode || 0;
+      if (opts.follow && status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) { reject(new Error('too many redirects')); return; }
+        resolve(fetchOnce(new URL(res.headers.location, u).toString(), redirectsLeft - 1));
+        return;
+      }
+      if (status >= 400 && opts.fail) {
+        res.resume();
+        const err = new Error(`HTTP ${status}`);
+        err.httpStatus = status;
+        reject(err);
+        return;
+      }
+      let out;
+      if (opts.output === null) {
+        out = process.stdout;
+      } else {
+        const target = opts.output === '' ? (u.pathname.split('/').pop() || 'index.html') : opts.output;
+        if (target === '-') { out = process.stdout; }
+        else out = fs.createWriteStream(target);
+      }
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(status); } };
+      res.on('error', reject);
+      if (out === process.stdout) {
+        res.pipe(out);
+        res.on('end', finish);
+      } else {
+        res.pipe(out);
+        out.on('finish', () => { out.close(finish); });
+        out.on('error', reject);
+      }
+    });
+    req.on('error', reject);
+    if (opts.maxTimeMs > 0) {
+      req.setTimeout(opts.maxTimeMs, () => {
+        const err = new Error('operation timed out');
+        err.timeout = true;
+        req.destroy(err);
+      });
+    }
+    req.end();
+  });
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (IS_WGET) parseWget(args); else parseCurl(args);
+  if (!opts.url) errExit(IS_WGET ? 1 : 2, 'no URL given');
+  let lastErr = null;
+  for (let attempt = 0; attempt <= opts.retries; attempt++) {
+    try {
+      await fetchOnce(opts.url, 10);
+      process.exit(0);
+    } catch (e) {
+      lastErr = e;
+      const retryable = !e.httpStatus || e.httpStatus >= 500 || e.httpStatus === 429;
+      if (attempt < opts.retries && retryable) {
+        if (opts.output && opts.output !== '-' && opts.output !== '') {
+          try { fs.unlinkSync(opts.output); } catch (_) {}
+        }
+        await new Promise((r) => setTimeout(r, opts.retryDelayMs));
+        continue;
+      }
+      break;
+    }
+  }
+  if (lastErr && lastErr.httpStatus) {
+    errExit(IS_WGET ? 8 : 22, `HTTP ${lastErr.httpStatus}`);
+  }
+  errExit(7, (lastErr && lastErr.message) || 'network error');
+}
+
+main();
