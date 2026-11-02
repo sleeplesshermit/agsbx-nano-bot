@@ -122,11 +122,31 @@ run_installer() {
 
 run_installer
 
+# Process check that does NOT depend on procps/pgrep: on Galaxy the
+# pgrep-based check silently failed (the daemons were healthy — the
+# tunnel stayed connected — yet the check reported both gone and
+# re-ran the installer every 60 s; found on the first Galaxy deploy,
+# 2026-11-02). Pure-bash scan of /proc cmdlines instead: match the
+# daemon's invocation form ("/<name> " or a cmdline starting with
+# "<name> "). No self-match: neither this shell's ("bash start.sh")
+# nor tr's cmdline contains those patterns.
+proc_alive() {
+  local name="$1" p cmd
+  for p in /proc/[0-9]*/cmdline; do
+    [ -r "$p" ] || continue
+    cmd=$(tr '\0' ' ' < "$p" 2>/dev/null) || continue
+    case "$cmd" in
+      *"/$name "*|"$name "*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # Supervise: the installer daemonizes xray + cloudflared. If BOTH
 # disappear (crash, OOM, platform cleanup), re-run the installer.
 while true; do
   sleep 60
-  if ! pgrep -f 'agsbx/xray' >/dev/null 2>&1 && ! pgrep -f 'agsbx/cloudflared' >/dev/null 2>&1; then
+  if ! proc_alive xray && ! proc_alive cloudflared; then
     echo "[agsbx-nano] xray and cloudflared both gone — re-running installer"
     run_installer
   fi
